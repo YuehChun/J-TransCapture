@@ -1,0 +1,30 @@
+# Environment
+.env
+
+# Media files
+*.mp4
+*.wav
+*.mp3
+*.m4a
+
+# Subtitle outputs
+*.srt
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
