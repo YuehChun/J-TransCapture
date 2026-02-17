@@ -9,6 +9,8 @@ import unicodedata
 from openai import OpenAI
 import srt
 
+from text_cleaner import clean_source_text, clean_translated_text
+
 BATCH_SIZE = 5
 API_TIMEOUT = 120
 MAX_RETRIES = 5
@@ -36,15 +38,18 @@ def init_client():
 
 
 def translate_batch(client, items):
-    numbered = "\n".join(f"[{idx}] {text}" for idx, text in items)
+    # 預處理：清理原文重複雜訊
+    cleaned_items = [(idx, clean_source_text(text)) for idx, text in items]
+    numbered = "\n".join(f"[{idx}] {text}" for idx, text in cleaned_items)
     prompt = f"""請將以下日文字幕翻譯為繁體中文。
 
 規則：
 1. 每行格式為 [編號] 文字，請保持相同格式輸出
 2. 保留 [編號] 不變，不要跳過任何一行
-3. 不要加任何說明，只輸出翻譯結果
-4. 語氣感嘆詞翻譯為對應中文感嘆詞
-5. 過濾掉重複無意義的字詞
+3. 只輸出翻譯結果，不加任何說明或註解
+4. 語氣感嘆詞翻譯為對應中文感嘆詞（如「嗯」「哈」「嗚」「啊」）
+5. 若原文是語音辨識雜訊，翻譯為最接近的簡短中文表達，不要保留重複
+6. 翻譯結果應自然流暢，不應出現同一個字或詞連續重複三次以上
 
 {numbered}"""
 
@@ -96,7 +101,8 @@ def retranslate_file(client, srt_path):
 
         results = translate_batch(client, batch)
         batch_changed = 0
-        for idx, new_text in results.items():
+        for idx, raw_text in results.items():
+            new_text = clean_translated_text(raw_text)
             if idx < len(subtitles) and new_text != subtitles[idx].content.strip():
                 subtitles[idx].content = new_text
                 batch_changed += 1

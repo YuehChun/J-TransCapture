@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 import srt
 
+from text_cleaner import clean_source_text, clean_translated_text, is_noise_only
+
 # --- 配置 ---
 TARGET_LANG = os.getenv("TARGET_LANG_CODE", "zh-TW")
 SOURCE_LANG = "ja"
@@ -47,11 +49,11 @@ def translate_batch(client, texts, start_idx, target_lang):
 
 規則：
 1. 每行格式為 [編號] 文字，請保持相同格式輸出
-2. 將日文語音內容翻譯為對應的{lang_name}語音內容
-3. 保留 [編號] 不變，不要跳過任何一行
-4. 不要加任何說明，只輸出翻譯結果
-5. 語氣感嘆詞（如「ん」「はぁ」「うっ」「ああ」）翻譯為對應的中文感嘆詞
-6. 過濾掉重複無意義的字詞（如連續重複的「ああああ」簡化為「啊」，「永永永永...」簡化為「永」）
+2. 保留 [編號] 不變，不要跳過任何一行
+3. 只輸出翻譯結果，不加任何說明或註解
+4. 語氣感嘆詞（如「ん」「はぁ」「うっ」「ああ」）翻譯為對應的{lang_name}感嘆詞（如「嗯」「哈」「嗚」「啊」）
+5. 若原文是語音辨識雜訊（無意義的重複字、亂碼、不成句的片段），直接翻譯為最接近的簡短{lang_name}表達，不要保留重複
+6. 每行翻譯結果應該是自然流暢的{lang_name}，不應出現同一個字或詞連續重複三次以上
 
 {numbered}"""
 
@@ -150,12 +152,29 @@ def translate_file(input_srt, output_srt, target_lang=None):
     lang_name = LANG_NAMES.get(target_lang, target_lang)
     print(f"翻譯方向：日文 → {lang_name}（模型：{MODEL}）")
 
-    texts = [sub.content.strip() for sub in subtitles]
+    raw_texts = [sub.content.strip() for sub in subtitles]
+
+    # 預處理：清理原文中的重複雜訊
+    texts = []
+    noise_indices = set()
+    for i, t in enumerate(raw_texts):
+        cleaned = clean_source_text(t)
+        if is_noise_only(t):
+            noise_indices.add(i)
+            texts.append(cleaned)  # 保留但標記為雜訊
+        else:
+            texts.append(cleaned)
+
+    if noise_indices:
+        print(f"預處理：偵測到 {len(noise_indices)} 段純雜訊字幕")
     print(f"共 {len(texts)} 段字幕，分 {(len(texts) + BATCH_SIZE - 1) // BATCH_SIZE} 批翻譯中...")
 
     translated = translate_all(client, texts, target_lang)
 
-    changed = sum(1 for i, t in enumerate(translated) if t != texts[i])
+    # 後處理：清理翻譯結果中的重複雜訊
+    translated = [clean_translated_text(t) for t in translated]
+
+    changed = sum(1 for i, t in enumerate(translated) if t != raw_texts[i])
     for i, trans in enumerate(translated):
         subtitles[i].content = trans
 

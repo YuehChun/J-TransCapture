@@ -8,6 +8,8 @@ import unicodedata
 from openai import OpenAI
 import srt
 
+from text_cleaner import clean_source_text, clean_translated_text
+
 BATCH_SIZE = 50
 API_TIMEOUT = 120
 MODEL = "z-ai/glm-4.5-air:free"
@@ -61,16 +63,18 @@ def retranslate_file(client, srt_path):
         if total_batches > 1:
             print(f"  批次 {batch_num}/{total_batches}（第 {start}-{end-1} 段）...")
 
-        numbered = "\n".join(f"[{start + i}] {t}" for i, t in enumerate(batch))
+        # 預處理：清理原文重複雜訊
+        cleaned_batch = [clean_source_text(t) for t in batch]
+        numbered = "\n".join(f"[{start + i}] {t}" for i, t in enumerate(cleaned_batch))
         prompt = f"""請將以下日文字幕翻譯為繁體中文。
 
 規則：
 1. 每行格式為 [編號] 文字，請保持相同格式輸出
-2. 將日文語音內容翻譯為對應的繁體中文語音內容
-3. 保留 [編號] 不變，不要跳過任何一行
-4. 不要加任何說明，只輸出翻譯結果
-5. 語氣感嘆詞（如「ん」「はぁ」「うっ」「ああ」）翻譯為對應的中文感嘆詞
-6. 過濾掉重複無意義的字詞（如連續重複的「ああああ」簡化為「啊」，「永永永永...」簡化為「永」）
+2. 保留 [編號] 不變，不要跳過任何一行
+3. 只輸出翻譯結果，不加任何說明或註解
+4. 語氣感嘆詞（如「ん」「はぁ」「うっ」「ああ」）翻譯為對應的中文感嘆詞（如「嗯」「哈」「嗚」「啊」）
+5. 若原文是語音辨識雜訊（無意義的重複字、亂碼、不成句的片段），直接翻譯為最接近的簡短中文表達，不要保留重複
+6. 每行翻譯結果應該是自然流暢的繁體中文，不應出現同一個字或詞連續重複三次以上
 
 {numbered}"""
 
@@ -95,7 +99,7 @@ def retranslate_file(client, srt_path):
 
     changed = 0
     for i in range(len(texts)):
-        trans = all_results.get(i, texts[i])
+        trans = clean_translated_text(all_results.get(i, texts[i]))
         old = subtitles[i].content.strip()
         if trans != old:
             subtitles[i].content = trans
