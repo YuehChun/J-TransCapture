@@ -1,13 +1,12 @@
 # Environment
 .env
 
-# Media files
+# Media & subtitle files (translate/ 目錄下按影片名稱分資料夾)
+translate/
 *.mp4
 *.wav
 *.mp3
 *.m4a
-
-# Subtitle outputs
 *.srt
 
 # macOS

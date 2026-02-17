@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""使用 faster-whisper 加速轉錄音訊為 SRT 字幕檔。
+"""使用 mlx-whisper 透過 Apple Silicon GPU 加速轉錄音訊為 SRT 字幕檔。
 
 加速技術：
-- CTranslate2 引擎：優化的 KV Cache、INT8/FP16 量化推理
-- 比原生 transformers pipeline 快 4 倍以上
-- 記憶體使用量更低
+- Apple MLX 框架：原生支援 Apple Silicon GPU (Metal)
+- 比 CPU 推理快約 3 倍
 - 內建幻覺過濾：移除重複/無意義的轉錄段落
 """
 
@@ -15,21 +14,16 @@ import sys
 from collections import Counter
 from datetime import timedelta
 
+import mlx_whisper
 import srt
-from faster_whisper import WhisperModel
 
-
-def get_device_and_compute():
-    """自動偵測最佳運算裝置與量化類型。"""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda", "float16"
-    except ImportError:
-        pass
-
-    # Mac CPU 或無 GPU：使用 INT8 量化加速
-    return "cpu", "int8"
+# MLX 模型對應表（HuggingFace Hub）
+MLX_MODELS = {
+    "tiny": "mlx-community/whisper-tiny",
+    "small": "mlx-community/whisper-small",
+    "medium": "mlx-community/whisper-medium",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+}
 
 
 def is_hallucination(text: str, seen_texts: Counter, threshold: int = 3) -> bool:
@@ -47,66 +41,58 @@ def transcribe(
     model_name: str = "large-v3",
     beam_size: int = 5,
 ) -> None:
-    """使用 faster-whisper 將音訊轉錄為 SRT 字幕。
+    """使用 mlx-whisper 將音訊轉錄為 SRT 字幕。
 
     Args:
         audio_path: 輸入音訊檔案路徑
         output_srt: 輸出 SRT 檔案路徑
-        model_name: CTranslate2 模型名稱
+        model_name: 模型名稱（tiny, small, medium, large-v3）
         beam_size: Beam search 大小（越大越精確但越慢）
     """
     if not os.path.exists(audio_path):
         print(f"錯誤：找不到音訊檔案 '{audio_path}'")
         sys.exit(1)
 
-    device, compute_type = get_device_and_compute()
-    print(f"使用裝置：{device} (量化：{compute_type})")
-    print(f"載入模型：{model_name}...")
-
-    model = WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-    )
-
+    model_repo = MLX_MODELS.get(model_name, model_name)
+    print(f"使用裝置：Apple Silicon GPU (MLX)")
+    print(f"載入模型：{model_repo}...")
     print(f"正在轉錄 '{audio_path}'...")
-    segments, info = model.transcribe(
+
+    result = mlx_whisper.transcribe(
         audio_path,
+        path_or_hf_repo=model_repo,
         language="ja",
         task="transcribe",
-        beam_size=beam_size,
-        vad_filter=False,
-        condition_on_previous_text=False,  # 防止幻覺連鎖
-        no_speech_threshold=0.5,           # 過濾靜音段落
-        compression_ratio_threshold=2.4,   # 過濾重複壓縮比過高的段落
+        condition_on_previous_text=False,
+        no_speech_threshold=0.5,
+        compression_ratio_threshold=2.4,
+        verbose=False,
     )
 
-    print(f"偵測語言：{info.language} (機率 {info.language_probability:.2%})")
+    detected_lang = result.get("language", "ja")
+    print(f"偵測語言：{detected_lang}")
 
-    # 收集所有 segments 並過濾幻覺
-    seen_texts = Counter()
-    raw_segments = list(segments)
+    raw_segments = result.get("segments", [])
     print(f"原始段數：{len(raw_segments)}")
 
+    seen_texts = Counter()
     subtitles = []
     for segment in raw_segments:
-        text = segment.text.strip()
+        text = segment["text"].strip()
         if not text:
             continue
 
-        # 過濾幻覺：同一文字重複出現超過 3 次
         if is_hallucination(text, seen_texts):
             continue
 
-        # 過濾過短的段落（可能是噪音誤判）
-        duration = segment.end - segment.start
+        duration = segment["end"] - segment["start"]
         if duration < 0.3 and len(text) <= 2:
             continue
 
         sub = srt.Subtitle(
             index=len(subtitles) + 1,
-            start=timedelta(seconds=segment.start),
-            end=timedelta(seconds=segment.end),
+            start=timedelta(seconds=segment["start"]),
+            end=timedelta(seconds=segment["end"]),
             content=text,
         )
         subtitles.append(sub)
@@ -121,13 +107,13 @@ def transcribe(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="使用 faster-whisper 加速轉錄音訊為 SRT 字幕")
+    parser = argparse.ArgumentParser(description="使用 mlx-whisper (Apple Silicon GPU) 轉錄音訊為 SRT 字幕")
     parser.add_argument("audio", help="輸入音訊檔案路徑")
     parser.add_argument("-o", "--output", default="audio.srt", help="輸出 SRT 檔案路徑 (預設: audio.srt)")
     parser.add_argument(
         "-m", "--model",
         default="large-v3",
-        help="模型名稱 (預設: large-v3，可用: small, medium, large-v3, kotoba-tech/kotoba-whisper-v2.0-faster)",
+        help="模型名稱 (預設: large-v3，可用: tiny, small, medium, large-v3)",
     )
     parser.add_argument(
         "-b", "--beam-size",

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""使用 Gemini API 將日語 SRT 字幕翻譯為中文。"""
+"""使用 OpenRouter (Grok 4 Fast) 將日語 SRT 字幕翻譯為中文。支援 CLI 及並行使用。"""
 
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 import srt
 
 # --- 配置 ---
-INPUT_SRT = os.getenv("INPUT_SRT_PATH", "audio.srt")
-OUTPUT_SRT = os.getenv("OUTPUT_SRT_PATH", "audio.zh-TW.srt")
 TARGET_LANG = os.getenv("TARGET_LANG_CODE", "zh-TW")
 SOURCE_LANG = "ja"
+BATCH_SIZE = 50
+MAX_RETRIES = 5
+API_TIMEOUT = 120
+MAX_WORKERS = 5  # 並行請求數（rate limit 16/min，留點餘裕）
+MODEL = "z-ai/glm-4.5-air:free"
 # --- 結束配置 ---
 
 LANG_NAMES = {
@@ -21,95 +25,153 @@ LANG_NAMES = {
 }
 
 
-def init_gemini():
-    """初始化 Gemini API。"""
-    api_key = os.environ.get("GEMINI_API_KEY")
+def init_client():
+    """初始化 OpenRouter API client。"""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("錯誤：請設定 GEMINI_API_KEY 環境變數。")
-        print("  export GEMINI_API_KEY='your-api-key-here'")
+        print("錯誤：請設定 OPENROUTER_API_KEY 環境變數。")
         sys.exit(1)
-    return genai.Client(api_key=api_key)
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        timeout=API_TIMEOUT,
+    )
 
 
-def translate_batch(client, texts, target_lang):
-    """批次翻譯多段文字，減少 API 呼叫次數。"""
-    if not texts:
-        return []
-
+def translate_batch(client, texts, start_idx, target_lang):
+    """送出一批字幕給 Grok 翻譯，含重試機制。"""
     lang_name = LANG_NAMES.get(target_lang, target_lang)
-    numbered = "\n".join(f"[{i}] {t}" for i, t in enumerate(texts))
+    numbered = "\n".join(f"[{start_idx + i}] {t}" for i, t in enumerate(texts))
 
-    prompt = f"""請將以下日文逐行翻譯為{lang_name}。
+    prompt = f"""請將以下日文字幕翻譯為{lang_name}。
 
 規則：
 1. 每行格式為 [編號] 文字，請保持相同格式輸出
-2. 只翻譯文字部分，保留 [編號] 不變
-3. 不要加任何說明，只輸出翻譯結果
-4. 語氣感嘆詞（如「ん」「はぁ」「うっ」）直接翻譯對應的中文感嘆詞
+2. 將日文語音內容翻譯為對應的{lang_name}語音內容
+3. 保留 [編號] 不變，不要跳過任何一行
+4. 不要加任何說明，只輸出翻譯結果
+5. 語氣感嘆詞（如「ん」「はぁ」「うっ」「ああ」）翻譯為對應的中文感嘆詞
+6. 過濾掉重複無意義的字詞（如連續重複的「ああああ」簡化為「啊」，「永永永永...」簡化為「永」）
 
 {numbered}"""
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.3),
-        )
-        # 解析回應
-        result = {}
-        for line in response.text.strip().split("\n"):
-            line = line.strip()
-            if line.startswith("[") and "]" in line:
-                bracket_end = line.index("]")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            text = response.choices[0].message.content.strip()
+            result = {}
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.startswith("[") and "]" in line:
+                    bracket_end = line.index("]")
+                    try:
+                        idx = int(line[1:bracket_end])
+                        content = line[bracket_end + 1:].strip()
+                        result[idx] = content
+                    except ValueError:
+                        continue
+            return result
+        except Exception as e:
+            err_str = str(e)
+            # 429 rate limit: 等待到 reset 時間
+            if "429" in err_str and attempt < MAX_RETRIES:
+                import re, json
+                wait = 60  # 預設等 60 秒
                 try:
-                    idx = int(line[1:bracket_end])
-                    text = line[bracket_end + 1:].strip()
-                    result[idx] = text
-                except ValueError:
-                    continue
+                    err_data = json.loads(err_str.split(" - ", 1)[1])
+                    reset_ms = int(err_data["error"]["metadata"]["headers"]["X-RateLimit-Reset"])
+                    wait = max(1, (reset_ms / 1000) - time.time())
+                except Exception:
+                    pass
+                wait = min(wait, 120)  # 最多等 2 分鐘
+                print(f"    rate limit，等待 {wait:.0f}s 後重試 ({attempt}/{MAX_RETRIES})...")
+                time.sleep(wait)
+            elif attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                print(f"    重試 {attempt}/{MAX_RETRIES}（{e}），等待 {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"    失敗（{e}）")
+                return {}
 
-        return [result.get(i, texts[i]) for i in range(len(texts))]
-    except Exception as e:
-        print(f"  翻譯錯誤：{e}")
-        return texts  # 失敗時返回原文
+
+def translate_all(client, texts, target_lang):
+    """並行分批送出字幕翻譯。"""
+    if not texts:
+        return []
+
+    total = len(texts)
+    all_results = {}
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # 建立所有批次任務
+    batches = []
+    for start in range(0, total, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, total)
+        batch_num = start // BATCH_SIZE + 1
+        batches.append((start, end, batch_num, texts[start:end]))
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
+        for start, end, batch_num, batch in batches:
+            future = executor.submit(translate_batch, client, batch, start, target_lang)
+            futures[future] = (start, end, batch_num)
+
+        for future in as_completed(futures):
+            start, end, batch_num = futures[future]
+            done += 1
+            result = future.result()
+            all_results.update(result)
+            print(f"  完成 {done}/{total_batches}（批次 {batch_num}，第 {start}-{end-1} 段，翻譯 {len(result)} 段）")
+
+    return [all_results.get(i, texts[i]) for i in range(total)]
 
 
-def process_srt_file():
-    """讀取、翻譯並保存 SRT 檔案。"""
+def translate_file(input_srt, output_srt, target_lang=None):
+    """翻譯單一 SRT 檔案。可被外部呼叫。"""
+    if target_lang is None:
+        target_lang = TARGET_LANG
+
     try:
-        with open(INPUT_SRT, "r", encoding="utf-8") as f:
+        with open(input_srt, "r", encoding="utf-8") as f:
             subtitles = list(srt.parse(f.read()))
     except FileNotFoundError:
-        print(f"錯誤：找不到檔案 '{INPUT_SRT}'")
-        sys.exit(1)
+        print(f"錯誤：找不到檔案 '{input_srt}'")
+        return False
 
-    print(f"載入 {len(subtitles)} 段字幕，來源：{INPUT_SRT}")
+    print(f"載入 {len(subtitles)} 段字幕，來源：{input_srt}")
 
-    client = init_gemini()
-    lang_name = LANG_NAMES.get(TARGET_LANG, TARGET_LANG)
-    print(f"翻譯方向：日文 → {lang_name}")
+    client = init_client()
+    lang_name = LANG_NAMES.get(target_lang, target_lang)
+    print(f"翻譯方向：日文 → {lang_name}（模型：{MODEL}）")
 
-    # 批次翻譯（每批 20 段）
-    batch_size = 20
     texts = [sub.content.strip() for sub in subtitles]
+    print(f"共 {len(texts)} 段字幕，分 {(len(texts) + BATCH_SIZE - 1) // BATCH_SIZE} 批翻譯中...")
 
-    for start in range(0, len(texts), batch_size):
-        end = min(start + batch_size, len(texts))
-        batch = texts[start:end]
-        translated = translate_batch(client, batch, TARGET_LANG)
+    translated = translate_all(client, texts, target_lang)
 
-        for i, trans in enumerate(translated):
-            idx = start + i
-            original = subtitles[idx].content.strip()
-            subtitles[idx].content = trans
-            print(f"  [{idx + 1}] {original} → {trans}")
+    changed = sum(1 for i, t in enumerate(translated) if t != texts[i])
+    for i, trans in enumerate(translated):
+        subtitles[i].content = trans
 
-    # 寫入翻譯結果
-    with open(OUTPUT_SRT, "w", encoding="utf-8") as f:
+    with open(output_srt, "w", encoding="utf-8") as f:
         f.write(srt.compose(subtitles))
 
-    print(f"\n翻譯完成！已儲存至 '{OUTPUT_SRT}'")
+    print(f"翻譯完成！{changed}/{len(texts)} 段已翻譯，儲存至 '{output_srt}'")
+    return True
 
 
 if __name__ == "__main__":
-    process_srt_file()
+    if len(sys.argv) >= 3:
+        input_path = sys.argv[1]
+        output_path = sys.argv[2]
+    else:
+        input_path = os.getenv("INPUT_SRT_PATH", "audio.srt")
+        output_path = os.getenv("OUTPUT_SRT_PATH", "audio.zh-TW.srt")
+
+    translate_file(input_path, output_path)
