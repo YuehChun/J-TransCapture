@@ -18,7 +18,7 @@ BATCH_SIZE = 50
 MAX_RETRIES = 5
 API_TIMEOUT = 120
 MAX_WORKERS = 5  # 並行請求數（rate limit 16/min，留點餘裕）
-MODEL = "z-ai/glm-4.5-air:free"
+MODEL = "x-ai/grok-4.1-fast"
 # --- 結束配置 ---
 
 LANG_NAMES = {
